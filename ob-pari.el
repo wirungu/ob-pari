@@ -1,82 +1,89 @@
-;;; ob-pari.el --- org-babel functions for PARI/GP evaluation
+;;; ob-pari.el --- org-babel functions for PARI/GP code evaluation -*- lexical-binding: t; -*-
 
-;; Keywords: literate programming, reproducible research, pari, gp
-;; Homepage: https://orgmode.org
-;; Version: 0.01
+;;; Commentary:
+;; Org-Babel support for evaluating PARI/GP code.
 
-;;; License:
-;; This program is free software; you can redistribute it and/or modify
-;; it under the terms of the GNU General Public License as published by
-;; the Free Software Foundation; either version 3, or (at your option)
-;; any later version.
+;;; Code:
 
-(require 'org-babel)
+(require 'org-macs)
+(org-assert-version)
+
+(require 'ob)
+(require 'ob-comint)
 (require 'comint)
 
-;; Add GP file extension for tangling
-(add-to-list 'org-babel-tangle-lang-exts '("gp" . "gp"))
+(defvar org-babel-header-args:pari '())
 
-;; Default header arguments for PARI/GP
-(defvar org-babel-default-header-args:pari
-  '((:session . "none")
-    (:results . "output"))
-  "Default arguments for evaluating PARI/GP blocks.")
+(defcustom org-babel-pari-command "gp"
+  "Name of command to use for executing PARI/GP code."
+  :group 'org-babel
+  :type 'string)
 
-(defconst org-babel-pari-eoe "org_babel_pari_eoe"
-  "String to signal end of PARI/GP output.")
+(defun org-babel-pari-initiate-session (&optional session _params)
+  "Start a GP session if one doesn't already exist."
+  (let ((session-name (or session "*PARI*")))
+    (unless (org-babel-comint-buffer-livep session-name)
+      (save-window-excursion
+        (apply 'make-comint-in-buffer "PARI" session-name org-babel-pari-command nil '("-q"))))
+    session-name))
 
-(defun org-babel-pari-table-or-string (results)
-  "If RESULTS look like a table, turn it into a Lisp table, otherwise return as string."
-  (let ((lines (split-string results "\n" t)))
-    (if (cl-every (lambda (line)
-                    (string-match-p "\`[0-9 	]+\'" line))
-                  lines)
-        (mapcar (lambda (line)
-                  (mapcar #'string-to-number (split-string line)))
-                lines)
-      results)))
+(defun org-babel-pari-format-val (val)
+  "Format VAL as a string of GP code."
+  (cond
+   ((listp val) (concat "[" (mapconcat #'org-babel-pari-format-val val ", ") "]"))
+   ((stringp val) (format "%S" val))
+   (t (format "%s" val))))
 
-(defun org-babel-pari-initiate-session (&optional session)
-  "Initiate or reuse a PARI/GP session named SESSION.
-If SESSION is "none", do not start any process."
-  (unless (string= session "none")
-    (let* ((name (if (stringp session) session "default"))
-           (buffer (get-buffer (format "*org-babel-pari-%s*" name))))
-      (unless (comint-check-proc buffer)
-        (apply #'make-comint-in-buffer name buffer "gp" nil '("-q" "-f")))
-      buffer)))
+(defun org-babel-variable-assignments:pari (params)
+  "Return list of GP code assigning the block's variables."
+  (mapcar (lambda (pair)
+            (format "%s = %s;" (car pair) (org-babel-pari-format-val (cdr pair))))
+          (org-babel--get-vars params)))
 
 (defun org-babel-expand-body:pari (body params)
-  "Expand BODY according to PARAMS."
-  ;; No variable substitution for now
-  body)
+  "Expand BODY with variable assignments, prologue and epilogue."
+  (mapconcat #'identity
+             (append
+              (org-babel-variable-assignments:pari params)
+              (when-let ((pro (cdr (assq :prologue params)))) (list pro))
+              (list body)
+              (when-let ((epi (cdr (assq :epilogue params)))) (list epi)))
+             "\n"))
 
+(defun org-babel-pari-clean-output (output)
+  "Clean OUTPUT from GP prompt and result prefix."
+  (replace-regexp-in-string "^%[0-9]+ = " "" (org-babel-chomp output)))
+
+(defun org-babel-pari-evaluate-session (session body result-type _result-params)
+  "Evaluate BODY in SESSION. Return result based on RESULT-TYPE."
+  (let* ((eoe "org_babel_pari_eoe")
+         (full-body (concat body "\nprint(\"" eoe "\")\n"))
+         (results (org-babel-comint-with-output (session eoe)
+                    (insert full-body)
+                    (comint-send-input))))
+    (org-babel-pari-clean-output
+     (mapconcat #'identity (butlast results) "\n"))))
+
+(defun org-babel-pari-evaluate-external-process (body _result-type _result-params)
+  "Evaluate BODY in external GP process. Return the output as string."
+  (let ((script-file (org-babel-temp-file "pari-" ".gp")))
+    (with-temp-file script-file
+      (insert body))
+    (org-babel-eval (concat org-babel-pari-command " -q " script-file) "")))
+
+;;;###autoload
 (defun org-babel-execute:pari (body params)
-  "Execute a block of PARI/GP code with Babel."
-  (let* ((session (cdr (assoc :session params)))
-         (result-type (cdr (assoc :result-type params)))
-         (buffer (org-babel-pari-initiate-session session))
-         (full-body (org-babel-expand-body:pari body params))
-         (eoe org-babel-pari-eoe)
-         (comint-output-filter-functions nil)
-         (results nil))
-    (with-current-buffer buffer
-      (goto-char (point-max))
-      (insert full-body)
-      (comint-send-input)
-      (insert (format "print(\"%s\")\n" eoe))
-      (comint-send-input)
-      (while (not (save-excursion
-                    (goto-char comint-last-input-end)
-                    (re-search-forward eoe nil t)))
-        (accept-process-output (get-buffer-process buffer) 0.1))
-      (setq results
-            (buffer-substring-no-properties
-             comint-last-input-end
-             (progn (goto-char comint-last-input-end)
-                    (re-search-forward eoe nil t)
-                    (match-beginning 0)))))
-    (org-babel-pari-table-or-string results)))
+  "Execute a block of PARI/GP code with org-babel."
+  (let* ((session (cdr (assq :session params)))
+         (result-type (cdr (assq :result-type params)))
+         (result-params (cdr (assq :result-params params)))
+         (full-body (org-babel-expand-body:pari body params)))
+    (if (or (not session) (string= session "none"))
+        (org-babel-pari-evaluate-external-process full-body result-type result-params)
+      (org-babel-pari-evaluate-session
+       (org-babel-pari-initiate-session session params)
+       full-body result-type result-params))))
 
 (provide 'ob-pari)
+
 ;;; ob-pari.el ends here
